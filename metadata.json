@@ -1,0 +1,5 @@
+{
+  "name": "Text-to-Speech Generator",
+  "description": "An application that uses the Gemini API to convert text into speech with various voice options.",
+  "requestFramePermissions": []
+}
