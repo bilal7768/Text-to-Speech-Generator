@@ -1,6 +1,6 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
-import { SpeakerWaveIcon, LoadingSpinnerIcon, DownloadIcon } from './components/Icons';
+import { SpeakerWaveIcon, LoadingSpinnerIcon } from './components/Icons';
 
 // Helper function to decode base64 string to Uint8Array
 function decode(base64: string): Uint8Array {
@@ -34,50 +34,51 @@ async function decodeAudioData(
 }
 
 // Helper function to convert an AudioBuffer to a WAV file Blob
-function bufferToWave(buffer: AudioBuffer): Blob {
-    const numOfChan = buffer.numberOfChannels;
-    const length = buffer.length * numOfChan * 2 + 44;
-    const bufferArray = new ArrayBuffer(length);
-    const view = new DataView(bufferArray);
-    const channels = [];
-    let i, sample;
-    let offset = 0;
-    let pos = 0;
+function audioBufferToWav(buffer: AudioBuffer): Blob {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const format = 1; // PCM
+    const bitDepth = 16;
 
-    // write WAVE header
-    setUint32(0x46464952, 36 + buffer.length * 2); // "RIFF"
-    setUint32(0x45564157, null); // "WAVE"
-    setUint32(0x20746d66, 16); // "fmt " chunk
-    setUint16(1, null); // PCM
-    setUint16(numOfChan, null);
-    setUint32(buffer.sampleRate, null);
-    setUint32(buffer.sampleRate * 2 * numOfChan, null); // byte rate
-    setUint16(numOfChan * 2, null); // block align
-    setUint16(16, null); // bits per sample
-    setUint32(0x61746164, buffer.length * 2 * numOfChan); // "data" chunk size
-
-    function setUint16(data: number, p: number | null) {
-        view.setUint16(pos, data, true);
-        pos += 2;
+    const channelData = buffer.getChannelData(0);
+    const pcmData = new Int16Array(channelData.length);
+    for (let i = 0; i < channelData.length; i++) {
+        pcmData[i] = Math.max(-1, Math.min(1, channelData[i])) * 32767;
     }
 
-    function setUint32(data: number, p: number | null) {
-        view.setUint32(pos, data, true);
-        pos += 4;
-    }
+    const dataLength = pcmData.length * (bitDepth / 8);
+    const bufferLength = 44 + dataLength;
+    const wavBuffer = new ArrayBuffer(bufferLength);
+    const view = new DataView(wavBuffer);
 
-    // write interleaved data
-    for (i = 0; i < buffer.numberOfChannels; i++)
-        channels.push(buffer.getChannelData(i));
-
-    while (pos < length) {
-        for (i = 0; i < numOfChan; i++) { // interleave channels
-            sample = Math.max(-1, Math.min(1, channels[i][offset])); // clamp
-            sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit signed int
-            view.setInt16(pos, sample, true); // write 16-bit sample
-            pos += 2;
+    function writeString(offset: number, str: string) {
+        for (let i = 0; i < str.length; i++) {
+            view.setUint8(offset + i, str.charCodeAt(i));
         }
-        offset++; // next source sample
+    }
+
+    // RIFF header
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + dataLength, true);
+    writeString(8, 'WAVE');
+
+    // fmt sub-chunk
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true); // Subchunk1Size
+    view.setUint16(20, format, true); // AudioFormat
+    view.setUint16(22, numChannels, true); // NumChannels
+    view.setUint32(24, sampleRate, true); // SampleRate
+    view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true); // ByteRate
+    view.setUint16(32, numChannels * (bitDepth / 8), true); // BlockAlign
+    view.setUint16(34, bitDepth, true); // BitsPerSample
+
+    // data sub-chunk
+    writeString(36, 'data');
+    view.setUint32(40, dataLength, true);
+
+    // Write PCM data
+    for (let i = 0; i < pcmData.length; i++) {
+        view.setInt16(44 + i * 2, pcmData[i], true);
     }
 
     return new Blob([view], { type: 'audio/wav' });
@@ -92,29 +93,23 @@ const voices = [
   { id: 'Zephyr', name: 'Zephyr' },
 ];
 
-const languages = [
-    { code: 'en-US', name: 'English' },
-    { code: 'es-ES', name: 'Spanish' },
-    { code: 'fr-FR', name: 'French' },
-    { code: 'de-DE', name: 'German' },
-    { code: 'hi-IN', name: 'Hindi' },
-    { code: 'it-IT', name: 'Italian' },
-    { code: 'ja-JP', name: 'Japanese' },
-    { code: 'pt-BR', name: 'Portuguese' },
-    { code: 'ru-RU', name: 'Russian' },
-    { code: 'zh-CN', name: 'Chinese (Mandarin)' },
-];
-
-
 const App: React.FC = () => {
   const [text, setText] = useState('');
   const [selectedVoice, setSelectedVoice] = useState(voices[0].id);
-  const [selectedLanguage, setSelectedLanguage] = useState(languages[0].name);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
+
+  // Effect to clean up the object URL to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      if (audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+      }
+    };
+  }, [audioUrl]);
 
   const handleGenerateSpeech = async () => {
     if (!text.trim()) {
@@ -128,12 +123,11 @@ const App: React.FC = () => {
 
     setIsLoading(true);
     setError(null);
-    setAudioBuffer(null);
+    setAudioUrl(null); // Clear previous audio
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      // Prepend the language instruction to the user's text
-      const prompt = `Say in ${selectedLanguage}: ${text}`;
+      const prompt = text;
 
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
@@ -164,13 +158,17 @@ const App: React.FC = () => {
           24000,
           1,
         );
-
-        setAudioBuffer(buffer);
-
+        
+        // Play the audio automatically once
         const source = outputAudioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(outputAudioContext.destination);
         source.start();
+
+        // Create a WAV blob and object URL for the audio player
+        const wavBlob = audioBufferToWav(buffer);
+        const url = URL.createObjectURL(wavBlob);
+        setAudioUrl(url);
 
       } else {
         throw new Error("No audio data received from the API.");
@@ -188,33 +186,13 @@ const App: React.FC = () => {
     }
   };
 
-  const handleDownload = () => {
-    if (!audioBuffer) {
-        setError("No audio available to download.");
-        return;
-    };
-    try {
-        const wavBlob = bufferToWave(audioBuffer);
-        const url = URL.createObjectURL(wavBlob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'speech.wav';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-    } catch (err) {
-        console.error("Download error:", err);
-        setError("Failed to prepare audio for download.");
-    }
-  }
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900 font-sans p-4">
       <div className="w-full max-w-2xl bg-gray-800 rounded-2xl shadow-2xl p-6 md:p-8 space-y-6 border border-gray-700">
         <header className="text-center">
           <h1 className="text-3xl md:text-4xl font-bold text-cyan-400">Text-to-Speech Generator</h1>
-          <p className="text-gray-400 mt-2">Convert your text into lifelike speech in multiple languages.</p>
+          <p className="text-gray-400 mt-2">Convert your text into lifelike speech.</p>
         </header>
 
         {error && (
@@ -233,39 +211,25 @@ const App: React.FC = () => {
                 aria-label="Text to convert to speech"
             />
             
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                 <div>
-                    <label htmlFor="language-select" className="block text-sm font-medium text-gray-400 mb-1">Language</label>
-                    <select
-                        id="language-select"
-                        value={selectedLanguage}
-                        onChange={(e) => setSelectedLanguage(e.target.value)}
-                        className="w-full p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500 transition-colors"
-                    >
-                        {languages.map((lang) => (
-                            <option key={lang.code} value={lang.name}>{lang.name}</option>
-                        ))}
-                    </select>
-                </div>
-                <div>
-                    <label htmlFor="voice-select" className="block text-sm font-medium text-gray-400 mb-1">Voice</label>
-                    <select
-                        id="voice-select"
-                        value={selectedVoice}
-                        onChange={(e) => setSelectedVoice(e.target.value)}
-                        className="w-full p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500 transition-colors"
-                    >
-                        {voices.map((voice) => (
-                            <option key={voice.id} value={voice.id}>{voice.name}</option>
-                        ))}
-                    </select>
-                </div>
+            <div>
+                <label htmlFor="voice-select" className="block text-sm font-medium text-gray-400 mb-1">Voice</label>
+                <select
+                    id="voice-select"
+                    value={selectedVoice}
+                    onChange={(e) => setSelectedVoice(e.target.value)}
+                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500 transition-colors"
+                >
+                    {voices.map((voice) => (
+                        <option key={voice.id} value={voice.id}>{voice.name}</option>
+                    ))}
+                </select>
             </div>
-            <div className="flex flex-col sm:flex-row items-center gap-4 pt-2">
+
+            <div className="pt-2">
                 <button
                     onClick={handleGenerateSpeech}
                     disabled={isLoading || !text.trim()}
-                    className="w-full sm:w-auto flex-grow flex items-center justify-center gap-2 px-6 py-2.5 bg-cyan-500 text-white font-semibold rounded-lg hover:bg-cyan-600 disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-4 focus:ring-cyan-300 focus:ring-opacity-50"
+                    className="w-full flex items-center justify-center gap-2 px-6 py-2.5 bg-cyan-500 text-white font-semibold rounded-lg hover:bg-cyan-600 disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-4 focus:ring-cyan-300 focus:ring-opacity-50"
                 >
                     {isLoading ? (
                         <>
@@ -279,17 +243,15 @@ const App: React.FC = () => {
                         </>
                     )}
                 </button>
-                {audioBuffer && (
-                     <button
-                        onClick={handleDownload}
-                        disabled={isLoading}
-                        className="w-full sm:w-auto flex items-center justify-center gap-2 px-6 py-2.5 bg-gray-600 text-white font-semibold rounded-lg hover:bg-gray-700 disabled:bg-gray-500 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-4 focus:ring-gray-400 focus:ring-opacity-50"
-                    >
-                        <DownloadIcon />
-                        Download WAV
-                    </button>
-                )}
             </div>
+            {audioUrl && !isLoading && (
+                 <div className="pt-4">
+                    <h3 className="text-lg font-semibold text-gray-300 mb-2">Playback</h3>
+                    <audio controls src={audioUrl} className="w-full rounded-lg" aria-label="Generated speech playback">
+                        Your browser does not support the audio element.
+                    </audio>
+                </div>
+            )}
         </div>
       </div>
        <footer className="text-center text-gray-600 mt-8 text-sm">
